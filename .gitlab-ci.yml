@@ -1,0 +1,33 @@
+stages:
+  - meta
+  - validate
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip/
+
+meta:check:
+  stage: meta
+  script:
+    - echo "Project SwiftPC"
+    - echo "Commit $CI_COMMIT_SHA by $CI_COMMIT_AUTHOR"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+
+validate:syntax:
+  stage: validate
+  image: python:3.11-slim
+  before_script:
+    - pip install rich pytest
+  script:
+    - python -m compileall -q main.py
+    - python -m pytest tests/ -q --tb=short
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - main.py
+        - tests/**/*
+        - requirements.txt
