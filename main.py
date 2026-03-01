@@ -14,6 +14,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Принудительно переключаем stdout/stderr на UTF-8 (CP1252 не поддерживает Rich-символы)
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
@@ -182,7 +187,7 @@ def set_power_plan(guid: str) -> bool:
 
 
 def switch_to_high_performance() -> str | None:
-    print_header("Power Plan → High Performance")
+    print_header("Power Plan -> High Performance")
     original = get_active_power_plan()
 
     if original and original.lower() == HIGH_PERF_GUID:
