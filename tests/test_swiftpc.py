@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import subprocess
 import sys
@@ -145,34 +146,47 @@ class TestRestoreWithoutState:
 # ─────────────────────────────────────────────────────────────────────
 
 class TestIsAdmin:
+    """
+    ctypes.windll существует только на Windows.
+    На Linux (CI) патчим через patch.object с create=True.
+    """
+
+    @staticmethod
+    def _mock_windll(retval: int) -> MagicMock:
+        mock = MagicMock()
+        mock.shell32.IsUserAnAdmin.return_value = retval
+        return mock
+
     def test_returns_true_when_admin(self) -> None:
-        with patch("ctypes.windll.shell32.IsUserAnAdmin", return_value=1):
+        with patch.object(ctypes, "windll", self._mock_windll(1), create=True):
             result = main.is_admin()
         assert result is True
         assert isinstance(result, bool)
 
     def test_returns_false_when_not_admin(self) -> None:
-        with patch("ctypes.windll.shell32.IsUserAnAdmin", return_value=0):
+        with patch.object(ctypes, "windll", self._mock_windll(0), create=True):
             result = main.is_admin()
         assert result is False
         assert isinstance(result, bool)
 
     def test_returns_false_on_exception(self) -> None:
         """Если ctypes бросает исключение — is_admin() должен вернуть False."""
-        with patch("ctypes.windll.shell32.IsUserAnAdmin", side_effect=OSError("no windll")):
+        mock = MagicMock()
+        mock.shell32.IsUserAnAdmin.side_effect = OSError("no windll")
+        with patch.object(ctypes, "windll", mock, create=True):
             result = main.is_admin()
         assert result is False
         assert isinstance(result, bool)
 
     def test_nonzero_nonone_is_true(self) -> None:
         """Любое ненулевое значение → True."""
-        with patch("ctypes.windll.shell32.IsUserAnAdmin", return_value=42):
+        with patch.object(ctypes, "windll", self._mock_windll(42), create=True):
             result = main.is_admin()
         assert result is True
 
     def test_return_type_is_always_bool(self) -> None:
         for retval in (0, 1, 2, -1):
-            with patch("ctypes.windll.shell32.IsUserAnAdmin", return_value=retval):
+            with patch.object(ctypes, "windll", self._mock_windll(retval), create=True):
                 assert isinstance(main.is_admin(), bool)
 
 
