@@ -1,10 +1,25 @@
-__pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
+# Build output
 dist/
 build/
 *.spec
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller
+*.manifest.bak
+
+# Native build artifacts
+native/swiftpc_native.exe
+native/swiftpc_native.res
+native/compile.sh
+
+# Runtime state
 .optimizer-state.json
-venv/
-.venv/
+
+# Editors
+.vscode/
+*.swp
+*~

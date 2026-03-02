@@ -11,6 +11,7 @@ import ctypes
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -195,6 +196,11 @@ class TestIsAdmin:
 # ─────────────────────────────────────────────────────────────────────
 
 class TestRun:
+    @pytest.fixture(autouse=True)
+    def reset_dry_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Гарантируем DRY_RUN=False для всех тестов этого класса."""
+        monkeypatch.setattr(main, "DRY_RUN", False)
+
     def test_returns_completed_process(self) -> None:
         fake = _completed(returncode=0, stdout="ok")
         with patch("subprocess.run", return_value=fake) as mock_sp:
@@ -414,3 +420,657 @@ class TestStopServices:
             result = main.stop_services()
 
         assert result == []
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 7. VERSION
+# ─────────────────────────────────────────────────────────────────────
+
+class TestVersion:
+    def test_version_exists(self) -> None:
+        assert hasattr(main, "VERSION")
+
+    def test_version_is_string(self) -> None:
+        assert isinstance(main.VERSION, str)
+
+    def test_version_format(self) -> None:
+        """VERSION должен быть в формате X.Y.Z где X, Y, Z — целые числа."""
+        parts = main.VERSION.split(".")
+        assert len(parts) == 3, f"Ожидается X.Y.Z, получено: {main.VERSION!r}"
+        for part in parts:
+            assert part.isdigit(), f"Компонент {part!r} не является числом"
+
+    def test_version_value(self) -> None:
+        assert main.VERSION == "1.2.0"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 8. DRY_RUN — run() не вызывает subprocess
+# ─────────────────────────────────────────────────────────────────────
+
+class TestDryRun:
+    def test_dry_run_returns_returncode_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(main, "DRY_RUN", True)
+        with patch("subprocess.run") as mock_sp:
+            result = main.run("some command")
+        mock_sp.assert_not_called()
+        assert result.returncode == 0
+
+    def test_dry_run_does_not_call_subprocess(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(main, "DRY_RUN", True)
+        with patch("subprocess.run") as mock_sp:
+            main.run("reg add HKLM\\\\test")
+        mock_sp.assert_not_called()
+
+    def test_dry_run_returns_completed_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(main, "DRY_RUN", True)
+        with patch("subprocess.run"):
+            result = main.run("any cmd")
+        assert isinstance(result, subprocess.CompletedProcess)
+
+    def test_dry_run_stdout_is_empty_string(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(main, "DRY_RUN", True)
+        with patch("subprocess.run"):
+            result = main.run("cmd")
+        assert result.stdout == ""
+
+    def test_dry_run_stderr_is_empty_string(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(main, "DRY_RUN", True)
+        with patch("subprocess.run"):
+            result = main.run("cmd")
+        assert result.stderr == ""
+
+    def test_normal_mode_calls_subprocess(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """При DRY_RUN=False subprocess.run вызывается как обычно."""
+        monkeypatch.setattr(main, "DRY_RUN", False)
+        fake = _completed(returncode=0, stdout="ok")
+        with patch("subprocess.run", return_value=fake) as mock_sp:
+            main.run("echo hello")
+        mock_sp.assert_called_once()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 9. disable_visual_effects() / restore_visual_effects()
+# ─────────────────────────────────────────────────────────────────────
+
+class TestDisableVisualEffects:
+    @pytest.fixture(autouse=True)
+    def _mock_windll(self) -> None:
+        """Мокаем ctypes.windll.user32.SystemParametersInfoW глобально для класса."""
+        mock_user32 = MagicMock()
+        mock_windll = MagicMock()
+        mock_windll.user32 = mock_user32
+        with patch.object(ctypes, "windll", mock_windll, create=True):
+            yield
+
+    def test_returns_true_on_success(self) -> None:
+        with patch.object(main, "run", return_value=_completed(returncode=0)):
+            result = main.disable_visual_effects()
+        assert result is True
+
+    def test_returns_false_on_failure(self) -> None:
+        with patch.object(main, "run", return_value=_completed(returncode=1)):
+            result = main.disable_visual_effects()
+        assert result is False
+
+    def test_calls_reg_add(self) -> None:
+        calls: list[str] = []
+
+        def track(cmd: str, **_kw: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return _completed(returncode=0)
+
+        with patch.object(main, "run", side_effect=track):
+            main.disable_visual_effects()
+
+        assert any("reg add" in c for c in calls)
+
+    def test_reg_sets_visualfxsetting_2(self) -> None:
+        """Реестровая запись должна устанавливать VisualFXSetting = 2."""
+        calls: list[str] = []
+
+        def track(cmd: str, **_kw: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return _completed(returncode=0)
+
+        with patch.object(main, "run", side_effect=track):
+            main.disable_visual_effects()
+
+        assert any("VisualFXSetting" in c and "/d 2" in c for c in calls)
+
+    def test_restore_calls_reg_add_with_zero(self) -> None:
+        """restore_visual_effects() должен выставить VisualFXSetting = 0."""
+        calls: list[str] = []
+
+        def track(cmd: str, **_kw: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return _completed(returncode=0)
+
+        with patch.object(main, "run", side_effect=track):
+            main.restore_visual_effects()
+
+        assert any("VisualFXSetting" in c and "/d 0" in c for c in calls)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 10. cleanup_temp()
+# ─────────────────────────────────────────────────────────────────────
+
+class TestCleanupTemp:
+    def test_removes_files(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Файлы во временной директории должны быть удалены."""
+        fake_temp = tmp_path / "temp"
+        fake_temp.mkdir()
+        (fake_temp / "file1.tmp").write_text("x")
+        (fake_temp / "file2.log").write_text("y")
+
+        # Подменяем оба пути: TEMP env var и C:/Windows/Temp
+        monkeypatch.setenv("TEMP", str(fake_temp))
+        # Второй путь — несуществующий, чтобы не трогать реальную систему
+        with patch.object(main.Path, "__new__", side_effect=lambda cls, *a, **kw: object.__new__(cls)):
+            pass  # не используем этот патч — вместо этого мокаем os.environ
+
+        # Проще: патчим temp_dirs внутри функции через monkeypatch env и несуществующий Windows/Temp
+        monkeypatch.setenv("TEMP", str(fake_temp))
+        # C:/Windows/Temp не существует в tmp_path — функция пропустит его
+
+        removed = main.cleanup_temp()
+        assert removed >= 2
+        assert not (fake_temp / "file1.tmp").exists()
+        assert not (fake_temp / "file2.log").exists()
+
+    def test_removes_subdirectories(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Поддиректории тоже должны удаляться."""
+        fake_temp = tmp_path / "temp"
+        fake_temp.mkdir()
+        subdir = fake_temp / "subdir"
+        subdir.mkdir()
+        (subdir / "nested.tmp").write_text("z")
+
+        monkeypatch.setenv("TEMP", str(fake_temp))
+
+        removed = main.cleanup_temp()
+        assert removed >= 1
+        assert not subdir.exists()
+
+    def test_returns_integer(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake_temp = tmp_path / "temp_empty"
+        fake_temp.mkdir()
+        monkeypatch.setenv("TEMP", str(fake_temp))
+
+        result = main.cleanup_temp()
+        assert isinstance(result, int)
+
+    def test_empty_dir_returns_zero(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake_temp = tmp_path / "temp_empty"
+        fake_temp.mkdir()
+        monkeypatch.setenv("TEMP", str(fake_temp))
+
+        result = main.cleanup_temp()
+        assert result == 0
+
+    def test_skips_locked_files(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Заблокированные файлы не должны прерывать выполнение."""
+        import shutil as _shutil
+
+        fake_temp = tmp_path / "temp"
+        fake_temp.mkdir()
+        good_file = fake_temp / "good.tmp"
+        good_file.write_text("ok")
+        bad_file = fake_temp / "locked.tmp"
+        bad_file.write_text("locked")
+
+        call_count = 0
+
+        def unlink_side_effect(self_path: Path, missing_ok: bool = False) -> None:
+            nonlocal call_count
+            call_count += 1
+            if self_path.name == "locked.tmp":
+                raise PermissionError("locked")
+            # Реальное удаление для остальных
+            _original_unlink(self_path)
+
+        _original_unlink = Path.unlink
+
+        monkeypatch.setenv("TEMP", str(fake_temp))
+
+        with patch.object(Path, "unlink", unlink_side_effect):
+            # Не должен бросить исключение
+            result = main.cleanup_temp()
+
+        assert isinstance(result, int)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 11. show_status()
+# ─────────────────────────────────────────────────────────────────────
+
+class TestShowStatus:
+    def test_no_state_prints_not_optimized(
+        self, isolated_state: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Без state-файла show_status() должен сообщить, что ПК не оптимизирован."""
+        assert not isolated_state.exists()
+
+        with patch.object(main, "get_active_power_plan", return_value=None), \
+             patch.object(main, "run", return_value=_completed(returncode=0, stdout="")):
+            main.show_status()
+
+        # Rich пишет в свой Console — перехватываем через patch на console.print
+        # Используем другой подход: патчим console.print и собираем вывод
+        printed: list[str] = []
+        with patch.object(main.console, "print", side_effect=lambda *a, **kw: printed.append(str(a[0]) if a else "")):
+            with patch.object(main, "get_active_power_plan", return_value=None), \
+                 patch.object(main, "run", return_value=_completed(returncode=0, stdout="")):
+                main.show_status()
+
+        combined = " ".join(printed)
+        assert "not currently optimized" in combined or "No state file" in combined
+
+    def test_with_state_prints_optimized(
+        self, isolated_state: Path
+    ) -> None:
+        """При наличии state-файла show_status() сообщает, что ПК оптимизирован."""
+        state_data = {
+            "killed": ["OneDrive.exe"],
+            "stopped_services": ["WSearch"],
+        }
+        isolated_state.write_text(json.dumps(state_data), encoding="utf-8")
+
+        printed: list[str] = []
+        with patch.object(main.console, "print", side_effect=lambda *a, **kw: printed.append(str(a[0]) if a else "")), \
+             patch.object(main, "get_active_power_plan", return_value=None), \
+             patch.object(main, "run", return_value=_completed(returncode=0, stdout="")):
+            main.show_status()
+
+        combined = " ".join(printed)
+        # Должно присутствовать либо сообщение об оптимизации, либо список процессов/сервисов
+        assert (
+            "optimized" in combined
+            or "OneDrive.exe" in combined
+            or "WSearch" in combined
+        )
+
+    def test_shows_running_bloatware(self, isolated_state: Path) -> None:
+        """show_status() должен показывать запущенные bloatware-процессы."""
+        printed: list[str] = []
+
+        def fake_run(cmd: str, **_kw: object) -> subprocess.CompletedProcess[str]:
+            # Имитируем что OneDrive.exe запущен
+            if "onedrive.exe" in cmd.lower():
+                return _completed(returncode=0, stdout="OneDrive.exe 1234 Console")
+            return _completed(returncode=0, stdout="")
+
+        with patch.object(main.console, "print", side_effect=lambda *a, **kw: printed.append(str(a[0]) if a else "")), \
+             patch.object(main, "get_active_power_plan", return_value=None), \
+             patch.object(main, "run", side_effect=fake_run):
+            main.show_status()
+
+        combined = " ".join(printed)
+        assert "OneDrive.exe" in combined
+
+    def test_no_bloatware_running(self, isolated_state: Path) -> None:
+        """Если bloatware не запущен — show_status() сообщает об этом."""
+        printed: list[str] = []
+
+        with patch.object(main.console, "print", side_effect=lambda *a, **kw: printed.append(str(a[0]) if a else "")), \
+             patch.object(main, "get_active_power_plan", return_value=None), \
+             patch.object(main, "run", return_value=_completed(returncode=0, stdout="")):
+            main.show_status()
+
+        combined = " ".join(printed)
+        assert "No bloatware running" in combined
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 12. find_native_helper()
+# ─────────────────────────────────────────────────────────────────────
+
+class TestFindNativeHelper:
+    def test_returns_none_when_exe_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Если swiftpc_native.exe отсутствует — возвращается None."""
+        # Убеждаемся, что нет _MEIPASS (не PyInstaller-среда)
+        monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+        # Указываем __file__ на tmp_path, где нет папки native/
+        monkeypatch.setattr(main, "__file__", str(tmp_path / "main.py"))
+        result = main.find_native_helper()
+        assert result is None
+
+    def test_returns_path_when_exe_exists_in_native(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Если swiftpc_native.exe лежит в native/ — возвращается Path к нему."""
+        monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+        native_dir = tmp_path / "native"
+        native_dir.mkdir()
+        exe = native_dir / "swiftpc_native.exe"
+        exe.write_bytes(b"fake")
+        monkeypatch.setattr(main, "__file__", str(tmp_path / "main.py"))
+        result = main.find_native_helper()
+        assert result is not None
+        assert result == exe
+
+    def test_returns_path_instance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Возвращаемый объект должен быть экземпляром Path."""
+        monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+        native_dir = tmp_path / "native"
+        native_dir.mkdir()
+        exe = native_dir / "swiftpc_native.exe"
+        exe.write_bytes(b"fake")
+        monkeypatch.setattr(main, "__file__", str(tmp_path / "main.py"))
+        result = main.find_native_helper()
+        assert isinstance(result, Path)
+
+    def test_meipass_lookup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """При наличии sys._MEIPASS поиск ведётся в этой директории."""
+        meipass_dir = tmp_path / "meipass"
+        meipass_dir.mkdir()
+        exe = meipass_dir / "swiftpc_native.exe"
+        exe.write_bytes(b"fake")
+        monkeypatch.setattr(sys, "_MEIPASS", str(meipass_dir), raising=False)
+        result = main.find_native_helper()
+        assert result is not None
+        assert result == exe
+
+    def test_meipass_returns_none_when_exe_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """При _MEIPASS без exe — тоже None."""
+        meipass_dir = tmp_path / "meipass_empty"
+        meipass_dir.mkdir()
+        monkeypatch.setattr(sys, "_MEIPASS", str(meipass_dir), raising=False)
+        result = main.find_native_helper()
+        assert result is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 13. disable_core_parking()
+# ─────────────────────────────────────────────────────────────────────
+
+class TestDisableCoreParking:
+    def test_returns_true_on_success(self) -> None:
+        """powercfg возвращает 0 — функция возвращает True."""
+        with patch.object(main, "run", return_value=_completed(returncode=0)):
+            result = main.disable_core_parking()
+        assert result is True
+
+    def test_returns_false_on_failure(self) -> None:
+        """powercfg возвращает 1 — функция возвращает False."""
+        with patch.object(main, "run", return_value=_completed(returncode=1)):
+            result = main.disable_core_parking()
+        assert result is False
+
+    def test_calls_powercfg_with_proc_subgroup_guid(self) -> None:
+        """Команда должна содержать GUID подгруппы процессора."""
+        calls: list[str] = []
+
+        def track(cmd: str, **_kw: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return _completed(returncode=0)
+
+        with patch.object(main, "run", side_effect=track):
+            main.disable_core_parking()
+
+        assert any(main._PROC_SUBGROUP in c for c in calls)
+
+    def test_calls_powercfg_with_core_park_guid(self) -> None:
+        """Команда должна содержать GUID параметра core parking."""
+        calls: list[str] = []
+
+        def track(cmd: str, **_kw: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return _completed(returncode=0)
+
+        with patch.object(main, "run", side_effect=track):
+            main.disable_core_parking()
+
+        assert any(main._CORE_PARK_GUID in c for c in calls)
+
+    def test_calls_powercfg_with_value_100(self) -> None:
+        """Команда должна содержать значение 100 (все ядра активны)."""
+        calls: list[str] = []
+
+        def track(cmd: str, **_kw: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return _completed(returncode=0)
+
+        with patch.object(main, "run", side_effect=track):
+            main.disable_core_parking()
+
+        assert any("100" in c and "powercfg" in c for c in calls)
+
+    def test_setactive_called_after_setacvalueindex(self) -> None:
+        """После setacvalueindex должен вызываться powercfg /setactive SCHEME_CURRENT."""
+        calls: list[str] = []
+
+        def track(cmd: str, **_kw: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return _completed(returncode=0)
+
+        with patch.object(main, "run", side_effect=track):
+            main.disable_core_parking()
+
+        assert any("setactive" in c and "SCHEME_CURRENT" in c for c in calls)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 14. restore_core_parking()
+# ─────────────────────────────────────────────────────────────────────
+
+class TestRestoreCoreParking:
+    def test_calls_powercfg_with_value_0(self) -> None:
+        """restore_core_parking() должен вызывать powercfg со значением 0."""
+        calls: list[str] = []
+
+        def track(cmd: str, **_kw: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return _completed(returncode=0)
+
+        with patch.object(main, "run", side_effect=track):
+            main.restore_core_parking()
+
+        assert any(
+            "powercfg" in c and main._CORE_PARK_GUID in c and c.rstrip().endswith("0")
+            for c in calls
+        )
+
+    def test_does_not_raise(self) -> None:
+        """restore_core_parking() не должен бросать исключения."""
+        with patch.object(main, "run", return_value=_completed(returncode=0)):
+            main.restore_core_parking()  # просто не упасть
+
+    def test_does_not_raise_on_run_failure(self) -> None:
+        """Даже при ошибке powercfg — исключение не пробрасывается."""
+        with patch.object(main, "run", return_value=_completed(returncode=1)):
+            main.restore_core_parking()  # просто не упасть
+
+    def test_calls_setactive_scheme_current(self) -> None:
+        """После изменения значения должен вызываться /setactive SCHEME_CURRENT."""
+        calls: list[str] = []
+
+        def track(cmd: str, **_kw: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return _completed(returncode=0)
+
+        with patch.object(main, "run", side_effect=track):
+            main.restore_core_parking()
+
+        assert any("setactive" in c and "SCHEME_CURRENT" in c for c in calls)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 15. set_timer_resolution() — fallback-путь (нет native-хелпера)
+# ─────────────────────────────────────────────────────────────────────
+
+class TestSetTimerResolution:
+    def test_calls_reg_add_system_responsiveness(self) -> None:
+        """Когда native-хелпер недоступен — вызывается reg add с SystemResponsiveness."""
+        calls: list[str] = []
+
+        def track(cmd: str, **_kw: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return _completed(returncode=0)
+
+        with patch.object(main, "find_native_helper", return_value=None), \
+             patch.object(main, "run", side_effect=track):
+            main.set_timer_resolution()
+
+        assert any("SystemResponsiveness" in c for c in calls)
+
+    def test_sets_system_responsiveness_to_zero(self) -> None:
+        """Значение SystemResponsiveness должно быть установлено в 0."""
+        calls: list[str] = []
+
+        def track(cmd: str, **_kw: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return _completed(returncode=0)
+
+        with patch.object(main, "find_native_helper", return_value=None), \
+             patch.object(main, "run", side_effect=track):
+            main.set_timer_resolution()
+
+        assert any("SystemResponsiveness" in c and "/d 0" in c for c in calls)
+
+    def test_calls_reg_add(self) -> None:
+        """Fallback должен использовать reg add."""
+        calls: list[str] = []
+
+        def track(cmd: str, **_kw: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            return _completed(returncode=0)
+
+        with patch.object(main, "find_native_helper", return_value=None), \
+             patch.object(main, "run", side_effect=track):
+            main.set_timer_resolution()
+
+        assert any("reg add" in c for c in calls)
+
+    def test_does_not_spawn_popen_when_no_helper(self) -> None:
+        """Без native-хелпера subprocess.Popen не должен вызываться."""
+        with patch.object(main, "find_native_helper", return_value=None), \
+             patch.object(main, "run", return_value=_completed(returncode=0)), \
+             patch("subprocess.Popen") as mock_popen:
+            main.set_timer_resolution()
+
+        mock_popen.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 16. optimize() — все 11 шагов выполняются
+# ─────────────────────────────────────────────────────────────────────
+
+class TestInteractiveMode:
+    """
+    optimize() запускает все 11 шагов оптимизации.
+    Каждая под-функция замокана — реальных системных вызовов нет.
+    """
+
+    @pytest.fixture()
+    def _mock_all_steps(self, isolated_state: Path) -> None:
+        """
+        Мокаем все функции-шаги optimize() так, чтобы они не делали
+        реальных вызовов и возвращали разумные значения.
+        """
+        self.mock_kill          = MagicMock(return_value=["OneDrive.exe"])
+        self.mock_stop          = MagicMock(return_value=["WSearch"])
+        self.mock_power         = MagicMock(return_value="balanced-guid")
+        self.mock_ram           = MagicMock(return_value=None)
+        self.mock_network       = MagicMock(return_value=True)
+        self.mock_gpu           = MagicMock(return_value=None)
+        self.mock_visual        = MagicMock(return_value=True)
+        self.mock_timer         = MagicMock(return_value=None)
+        self.mock_temp          = MagicMock(return_value=5)
+        self.mock_core_parking  = MagicMock(return_value=True)
+        self.mock_summary       = MagicMock(return_value=None)
+
+    def test_all_steps_called(self, _mock_all_steps: None, isolated_state: Path) -> None:
+        """optimize() должен вызвать все 11 функций-шагов."""
+        with patch.object(main, "kill_bloatware",          self.mock_kill), \
+             patch.object(main, "stop_services",           self.mock_stop), \
+             patch.object(main, "switch_to_high_performance", self.mock_power), \
+             patch.object(main, "cleanup_ram",             self.mock_ram), \
+             patch.object(main, "optimize_network",        self.mock_network), \
+             patch.object(main, "set_gpu_priority",        self.mock_gpu), \
+             patch.object(main, "disable_visual_effects",  self.mock_visual), \
+             patch.object(main, "set_timer_resolution",    self.mock_timer), \
+             patch.object(main, "cleanup_temp",            self.mock_temp), \
+             patch.object(main, "disable_core_parking",    self.mock_core_parking), \
+             patch.object(main, "print_summary",           self.mock_summary):
+            main.optimize()
+
+        self.mock_kill.assert_called_once()
+        self.mock_stop.assert_called_once()
+        self.mock_power.assert_called_once()
+        self.mock_ram.assert_called_once()
+        self.mock_network.assert_called_once()
+        self.mock_gpu.assert_called_once()
+        self.mock_visual.assert_called_once()
+        self.mock_timer.assert_called_once()
+        self.mock_temp.assert_called_once()
+        self.mock_core_parking.assert_called_once()
+        self.mock_summary.assert_called_once()
+
+    def test_state_saved_after_optimize(self, _mock_all_steps: None, isolated_state: Path) -> None:
+        """optimize() должен сохранить state-файл после завершения."""
+        with patch.object(main, "kill_bloatware",          self.mock_kill), \
+             patch.object(main, "stop_services",           self.mock_stop), \
+             patch.object(main, "switch_to_high_performance", self.mock_power), \
+             patch.object(main, "cleanup_ram",             self.mock_ram), \
+             patch.object(main, "optimize_network",        self.mock_network), \
+             patch.object(main, "set_gpu_priority",        self.mock_gpu), \
+             patch.object(main, "disable_visual_effects",  self.mock_visual), \
+             patch.object(main, "set_timer_resolution",    self.mock_timer), \
+             patch.object(main, "cleanup_temp",            self.mock_temp), \
+             patch.object(main, "disable_core_parking",    self.mock_core_parking), \
+             patch.object(main, "print_summary",           self.mock_summary):
+            main.optimize()
+
+        assert isolated_state.exists()
+        state = json.loads(isolated_state.read_text(encoding="utf-8"))
+        assert "killed" in state
+        assert "stopped_services" in state
+
+    def test_optimize_does_not_call_input(self, _mock_all_steps: None, isolated_state: Path) -> None:
+        """optimize() сам по себе не вызывает input() — это делает main()."""
+        with patch.object(main, "kill_bloatware",          self.mock_kill), \
+             patch.object(main, "stop_services",           self.mock_stop), \
+             patch.object(main, "switch_to_high_performance", self.mock_power), \
+             patch.object(main, "cleanup_ram",             self.mock_ram), \
+             patch.object(main, "optimize_network",        self.mock_network), \
+             patch.object(main, "set_gpu_priority",        self.mock_gpu), \
+             patch.object(main, "disable_visual_effects",  self.mock_visual), \
+             patch.object(main, "set_timer_resolution",    self.mock_timer), \
+             patch.object(main, "cleanup_temp",            self.mock_temp), \
+             patch.object(main, "disable_core_parking",    self.mock_core_parking), \
+             patch.object(main, "print_summary",           self.mock_summary), \
+             patch("builtins.input") as mock_input:
+            main.optimize()
+
+        mock_input.assert_not_called()
+
+    def test_core_parking_result_stored_in_state(
+        self, _mock_all_steps: None, isolated_state: Path
+    ) -> None:
+        """Если disable_core_parking() вернул True — state содержит core_parking_disabled=True."""
+        self.mock_core_parking.return_value = True
+
+        with patch.object(main, "kill_bloatware",          self.mock_kill), \
+             patch.object(main, "stop_services",           self.mock_stop), \
+             patch.object(main, "switch_to_high_performance", self.mock_power), \
+             patch.object(main, "cleanup_ram",             self.mock_ram), \
+             patch.object(main, "optimize_network",        self.mock_network), \
+             patch.object(main, "set_gpu_priority",        self.mock_gpu), \
+             patch.object(main, "disable_visual_effects",  self.mock_visual), \
+             patch.object(main, "set_timer_resolution",    self.mock_timer), \
+             patch.object(main, "cleanup_temp",            self.mock_temp), \
+             patch.object(main, "disable_core_parking",    self.mock_core_parking), \
+             patch.object(main, "print_summary",           self.mock_summary):
+            main.optimize()
+
+        state = main.load_state()
+        assert state is not None
+        assert state.get("core_parking_disabled") is True

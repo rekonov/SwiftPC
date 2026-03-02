@@ -10,8 +10,10 @@ import argparse
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Принудительно переключаем stdout/stderr на UTF-8 (CP1252 не поддерживает Rich-символы)
@@ -22,12 +24,19 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from rich.table import Table
 
 # ── Конфиг ───────────────────────────────────────────────────────────
+
+VERSION = "1.2.0"
+
+DRY_RUN = False
 
 STATE_FILE = Path(__file__).parent / ".optimizer-state.json"
 
 console = Console()
+
+_timer_process: subprocess.Popen | None = None
 
 # Процессы которые можно безопасно убить во время игры
 BLOATWARE_PROCESSES = [
@@ -74,6 +83,9 @@ def is_admin() -> bool:
 
 
 def run(cmd: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+    if DRY_RUN:
+        console.print(f"  [dim][DRY RUN] {cmd[:80]}[/]")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
     return subprocess.run(
         cmd, shell=True, capture_output=True, text=True, check=check,
     )
@@ -93,6 +105,15 @@ def print_skip(msg: str) -> None:
 
 def print_err(msg: str) -> None:
     console.print(f"  [bold red]✗[/] {msg}")
+
+
+def find_native_helper() -> Path | None:
+    """Finds swiftpc_native.exe — bundled (PyInstaller) or in native/ folder."""
+    if hasattr(sys, "_MEIPASS"):
+        helper = Path(sys._MEIPASS) / "swiftpc_native.exe"
+    else:
+        helper = Path(__file__).parent / "native" / "swiftpc_native.exe"
+    return helper if helper.exists() else None
 
 
 # ── 1. Kill bloatware ────────────────────────────────────────────────
@@ -221,18 +242,24 @@ def cleanup_ram() -> None:
         if result.returncode == 0:
             print_ok("Flushed DNS cache")
 
-        # Clear standby list via PowerShell (нужен EmptyStandbyList или RAMMap)
-        # Альтернатива — через .NET GC
-        ps_cmd = (
-            "powershell -Command \""
-            "[System.GC]::Collect(); "
-            "[System.GC]::WaitForPendingFinalizers(); "
-            "Write-Host 'GC completed'"
-            "\""
-        )
-        result = run(ps_cmd)
-        if result.returncode == 0:
-            print_ok("Triggered .NET GC")
+        # Flush RAM standby list — native helper is more effective
+        helper = find_native_helper()
+        if helper:
+            result = run(f'"{helper}" flush-ram')
+            if result.returncode == 0:
+                print_ok("Flushed RAM standby list (native)")
+            else:
+                print_err("Native flush-ram failed")
+        else:
+            ps_cmd = (
+                "powershell -Command \""
+                "[System.GC]::Collect(); "
+                "[System.GC]::WaitForPendingFinalizers(); "
+                "Write-Host 'GC completed'"
+                "\""
+            )
+            run(ps_cmd)
+            print_ok("Triggered .NET GC (no native helper found)")
 
     # Освобождаем working set текущего процесса
     print_ok("RAM cleanup done")
@@ -331,6 +358,218 @@ def set_gpu_priority() -> None:
         print_ok("GPU priority set to 8, CPU priority to High")
 
 
+# ── 7. Visual effects ────────────────────────────────────────────────
+
+def disable_visual_effects() -> bool:
+    """Устанавливает режим Best Performance для визуальных эффектов Windows."""
+    print_header("Visual Effects -> Best Performance")
+    with console.status("[cyan]Disabling visual effects...", spinner="dots"):
+        # VisualFXSetting = 2 (Best Performance)
+        r1 = run(
+            'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects" '
+            '/v VisualFXSetting /t REG_DWORD /d 2 /f'
+        )
+        # Отключаем анимации через SystemParametersInfo немедленно
+        SPI_SETUIEFFECTS = 0x103F
+        ctypes.windll.user32.SystemParametersInfoW(SPI_SETUIEFFECTS, 0, 0, 3)
+        if r1.returncode == 0:
+            print_ok("Visual effects set to Best Performance")
+            return True
+        print_err("Failed to disable visual effects")
+        return False
+
+
+def restore_visual_effects() -> None:
+    """Восстанавливает режим визуальных эффектов Windows по умолчанию."""
+    print_header("Restore Visual Effects")
+    with console.status("[cyan]Restoring visual effects...", spinner="dots"):
+        run(
+            'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects" '
+            '/v VisualFXSetting /t REG_DWORD /d 0 /f'  # 0 = Let Windows choose
+        )
+        SPI_SETUIEFFECTS = 0x103F
+        ctypes.windll.user32.SystemParametersInfoW(SPI_SETUIEFFECTS, 0, ctypes.c_void_p(1), 3)
+        print_ok("Visual effects restored")
+
+
+# ── 8. Timer resolution ──────────────────────────────────────────────
+
+def set_timer_resolution() -> None:
+    """Sets 1ms timer resolution via native helper (background process) or registry fallback."""
+    global _timer_process
+    print_header("Timer Resolution")
+    with console.status("[cyan]Setting timer resolution...", spinner="dots"):
+        helper = find_native_helper()
+        if helper and not DRY_RUN:
+            _timer_process = subprocess.Popen(
+                [str(helper), "keep-timer"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print_ok("Timer resolution set to 1ms (native, active while SwiftPC runs)")
+        elif helper and DRY_RUN:
+            print_ok("[DRY RUN] Would set 1ms timer resolution via native helper")
+        else:
+            run(
+                'reg add "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile" '
+                '/v SystemResponsiveness /t REG_DWORD /d 0 /f'
+            )
+            print_ok("SystemResponsiveness set to 0 (registry fallback)")
+
+
+def restore_timer_resolution() -> None:
+    """Restores timer resolution to default."""
+    global _timer_process
+    print_header("Restore Timer Resolution")
+    with console.status("[cyan]Restoring timer resolution...", spinner="dots"):
+        helper = find_native_helper()
+        if helper:
+            run(f'"{helper}" stop-timer')
+            if _timer_process is not None:
+                try:
+                    _timer_process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    _timer_process.kill()
+                _timer_process = None
+            print_ok("Timer resolution restored (native)")
+        else:
+            run(
+                'reg add "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile" '
+                '/v SystemResponsiveness /t REG_DWORD /d 20 /f'
+            )
+            print_ok("SystemResponsiveness restored to 20 (default)")
+
+
+# ── 11. CPU Core Parking ─────────────────────────────────────────────
+
+_PROC_SUBGROUP   = "54533251-82be-4824-96c1-47b60b740d00"
+_CORE_PARK_GUID  = "0cc5b647-c1df-4637-891a-dec35c318583"
+
+
+def disable_core_parking() -> bool:
+    """Disables CPU core parking so all cores stay active during gaming."""
+    print_header("CPU Core Parking")
+    with console.status("[cyan]Disabling CPU core parking...", spinner="dots"):
+        r = run(
+            f'powercfg /setacvalueindex SCHEME_CURRENT '
+            f'{_PROC_SUBGROUP} {_CORE_PARK_GUID} 100'
+        )
+        run('powercfg /setactive SCHEME_CURRENT')
+        if r.returncode == 0:
+            print_ok("CPU core parking disabled (all cores active)")
+            return True
+        print_err("Failed to disable core parking")
+        return False
+
+
+def restore_core_parking() -> None:
+    """Restores CPU core parking to default."""
+    print_header("Restore CPU Core Parking")
+    with console.status("[cyan]Restoring CPU core parking...", spinner="dots"):
+        run(
+            f'powercfg /setacvalueindex SCHEME_CURRENT '
+            f'{_PROC_SUBGROUP} {_CORE_PARK_GUID} 0'
+        )
+        run('powercfg /setactive SCHEME_CURRENT')
+        print_ok("CPU core parking restored to default")
+
+
+# ── 9. Temp cleanup ──────────────────────────────────────────────────
+
+def cleanup_temp() -> int:
+    """Очищает временные файлы из TEMP и C:/Windows/Temp. Возвращает количество удалённых элементов."""
+    print_header("Temp Files Cleanup")
+    removed = 0
+    temp_dirs = [
+        Path(os.environ.get("TEMP", "")),
+        Path("C:/Windows/Temp"),
+    ]
+    with console.status("[cyan]Cleaning temp files...", spinner="dots"):
+        for temp_dir in temp_dirs:
+            if not temp_dir.exists():
+                continue
+            for item in temp_dir.iterdir():
+                try:
+                    if item.is_file():
+                        item.unlink()
+                        removed += 1
+                    elif item.is_dir():
+                        shutil.rmtree(item)
+                        removed += 1
+                except Exception:
+                    pass
+        print_ok(f"Removed {removed} temp items")
+    return removed
+
+
+# ── 10. Summary table ────────────────────────────────────────────────
+
+def print_summary(state: dict) -> None:
+    """Выводит итоговую таблицу результатов оптимизации."""
+    table = Table(title="Optimization Summary", show_header=True, header_style="bold cyan", expand=False)
+    table.add_column("Step", style="dim", min_width=24)
+    table.add_column("Result", justify="right")
+
+    killed = state.get("killed", [])
+    stopped = state.get("stopped_services", [])
+    temp_removed = state.get("temp_removed", 0)
+
+    table.add_row("Processes killed", f"[green]{len(killed)}[/]" if killed else "[dim]0[/]")
+    table.add_row("Services stopped", f"[green]{len(stopped)}[/]" if stopped else "[dim]0[/]")
+    table.add_row("Power plan", "[green]High Performance[/]" if state.get("original_power_plan") else "[dim]Already optimal[/]")
+    table.add_row("Network tweaks", "[green]Applied[/]" if state.get("network_tweaked") else "[dim]Skipped[/]")
+    table.add_row("Visual effects", "[green]Disabled[/]" if state.get("visual_effects_changed") else "[dim]Skipped[/]")
+    table.add_row("Timer resolution", "[green]Optimized[/]" if state.get("timer_resolution_set") else "[dim]Skipped[/]")
+    table.add_row("Temp files removed", f"[green]{temp_removed}[/]" if temp_removed else "[dim]0[/]")
+    table.add_row("Core parking", "[green]Disabled[/]" if state.get("core_parking_disabled") else "[dim]Skipped[/]")
+
+    console.print(table)
+
+
+# ── 11. Status ───────────────────────────────────────────────────────
+
+def show_status() -> None:
+    """Показывает текущий статус оптимизации ПК."""
+    print_header("SwiftPC — STATUS")
+
+    state = load_state()
+    if state:
+        age_sec = time.time() - STATE_FILE.stat().st_mtime
+        age_h = age_sec / 3600
+        age_str = f"{age_h:.1f}h ago"
+        if age_h > 8:
+            console.print(f"  [yellow]⚠  Optimized {age_str} — state may be stale[/]")
+        else:
+            console.print(f"  [green]✓[/]  PC is currently optimized (state saved {age_str})")
+        killed = state.get("killed", [])
+        stopped = state.get("stopped_services", [])
+        if killed:
+            console.print(f"  [dim]Killed processes:[/] {', '.join(killed)}")
+        if stopped:
+            console.print(f"  [dim]Stopped services:[/] {', '.join(stopped)}")
+    else:
+        console.print("  [dim]No state file — PC is not currently optimized[/]")
+
+    # Текущий power plan
+    current = get_active_power_plan()
+    if current:
+        if current.lower() == HIGH_PERF_GUID:
+            console.print("  [green]✓[/]  Power plan: High Performance")
+        else:
+            console.print(f"  [dim]Power plan: {current}[/]")
+
+    # Запущенные bloatware-процессы
+    running = []
+    for proc in BLOATWARE_PROCESSES:
+        r = run(f'tasklist /FI "IMAGENAME eq {proc}" /NH')
+        if proc.lower() in r.stdout.lower():
+            running.append(proc)
+    if running:
+        console.print(f"  [yellow]Running bloatware:[/] {', '.join(running)}")
+    else:
+        console.print("  [green]✓[/]  No bloatware running")
+
+
 # ── State management ────────────────────────────────────────────────
 
 def save_state(state: dict) -> None:
@@ -379,8 +618,27 @@ def optimize() -> None:
     # 6. GPU priority
     set_gpu_priority()
 
+    # 7. Visual effects
+    if disable_visual_effects():
+        state["visual_effects_changed"] = True
+
+    # 8. Timer resolution
+    set_timer_resolution()
+    state["timer_resolution_set"] = True
+
+    # 9. Temp cleanup
+    temp_removed = cleanup_temp()
+    state["temp_removed"] = temp_removed
+
+    # 11. CPU core parking
+    if disable_core_parking():
+        state["core_parking_disabled"] = True
+
     # Save state for restore
     save_state(state)
+
+    # Summary
+    print_summary(state)
 
     console.print(Panel(
         f"[bold green]PC optimized for gaming![/]\n"
@@ -399,6 +657,11 @@ def restore() -> None:
         print_err("No saved state found. Nothing to restore.")
         return
 
+    if STATE_FILE.exists():
+        age_h = (time.time() - STATE_FILE.stat().st_mtime) / 3600
+        if age_h > 8:
+            console.print(f"  [yellow]⚠  State file is {age_h:.1f}h old — some settings may have changed[/]")
+
     # Restore services
     stopped = state.get("stopped_services", [])
     if stopped:
@@ -412,6 +675,18 @@ def restore() -> None:
     # Restore network
     if state.get("network_tweaked"):
         restore_network()
+
+    # Restore visual effects
+    if state.get("visual_effects_changed"):
+        restore_visual_effects()
+
+    # Restore timer resolution
+    if state.get("timer_resolution_set"):
+        restore_timer_resolution()
+
+    # Restore core parking
+    if state.get("core_parking_disabled"):
+        restore_core_parking()
 
     clear_state()
 
@@ -428,7 +703,27 @@ def main() -> None:
         "--restore", action="store_true",
         help="Restore settings to pre-optimization state",
     )
+    parser.add_argument(
+        "--status", action="store_true",
+        help="Show current optimization status",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be done without executing",
+    )
+    parser.add_argument(
+        "--no-wait", action="store_true",
+        help="Optimize and exit immediately without waiting to restore (scripting mode)",
+    )
+    parser.add_argument(
+        "--version", action="version",
+        version=f"SwiftPC {VERSION}",
+    )
     args = parser.parse_args()
+
+    if args.dry_run:
+        global DRY_RUN
+        DRY_RUN = True
 
     if not is_admin():
         console.print(Panel(
@@ -439,10 +734,26 @@ def main() -> None:
         ))
         sys.exit(1)
 
-    if args.restore:
+    if args.status:
+        show_status()
+    elif args.restore:
         restore()
     else:
         optimize()
+        if not args.no_wait:
+            console.print(Panel(
+                "[bold green]🎮  Gaming mode is ACTIVE[/]\n\n"
+                "Press [bold][Enter][/] when you're done playing\n"
+                "to restore all settings automatically.",
+                title="[bold green]READY[/]",
+                style="green",
+                expand=False,
+            ))
+            try:
+                input()
+            except (KeyboardInterrupt, EOFError):
+                pass
+            restore()
 
 
 if __name__ == "__main__":
