@@ -1,33 +1,76 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
 stages:
   - meta
   - validate
+  - build
+
+default:
+  image: python:3.10-slim
+  interruptible: true
 
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
 
 cache:
+  key: "pip-$CI_COMMIT_REF_SLUG"
   paths:
-    - .cache/pip/
+    - .cache/pip
 
-meta:check:
+pipeline_smoke:
   stage: meta
   script:
-    - echo "Project SwiftPC"
-    - echo "Commit $CI_COMMIT_SHA by $CI_COMMIT_AUTHOR"
-  rules:
-    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - echo "Pipeline started for $CI_COMMIT_SHORT_SHA"
+    - python --version
 
-validate:syntax:
+lint:
   stage: validate
-  image: python:3.11-slim
-  before_script:
-    - pip install rich pytest
-  script:
-    - python -m compileall -q main.py
-    - python -m pytest tests/ -q --tb=short
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "push"'
-      changes:
-        - main.py
+    - changes:
+        - "*.py"
         - tests/**/*
-        - requirements.txt
+        - requirements*.txt
+        - .gitlab-ci.yml
+  before_script:
+    - pip install ruff
+  script:
+    - ruff check .
+
+pytest:
+  stage: validate
+  rules:
+    - changes:
+        - "*.py"
+        - tests/**/*
+        - requirements*.txt
+        - .gitlab-ci.yml
+  before_script:
+    - pip install rich pytest pytest-mock
+  script:
+    - python -m pytest tests/test_swiftpc.py -v --tb=short
+
+# Сборка требует Windows runner с MSYS2 + PyInstaller.
+# Запускается вручную через GitLab UI.
+build_exe:
+  stage: build
+  tags:
+    - windows
+    - swiftpc
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+    - when: never
+  before_script:
+    - python -m pip install --upgrade pip
+    - pip install pyinstaller rich
+  script:
+    - g++ -O2 -o native/swiftpc_native.exe native/swiftpc_native.cpp -lwinmm -mwindows
+    - python -m PyInstaller --onefile --name SwiftPC --uac-admin --collect-all rich --add-binary "native/swiftpc_native.exe;." --hidden-import ctypes --hidden-import ctypes.windll main.py
+  artifacts:
+    paths:
+      - dist/SwiftPC.exe
+    expire_in: 7 days
+  allow_failure: false
