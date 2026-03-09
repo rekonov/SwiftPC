@@ -11,10 +11,8 @@ import ctypes
 import json
 import subprocess
 import sys
-import time
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -203,7 +201,7 @@ class TestRun:
 
     def test_returns_completed_process(self) -> None:
         fake = _completed(returncode=0, stdout="ok")
-        with patch("subprocess.run", return_value=fake) as mock_sp:
+        with patch("subprocess.run", return_value=fake):
             result = main.run("echo test")
         assert isinstance(result, subprocess.CompletedProcess)
         assert result.returncode == 0
@@ -233,7 +231,7 @@ class TestRun:
     def test_check_false_by_default(self) -> None:
         fake = _completed(returncode=1)
         with patch("subprocess.run", return_value=fake) as mock_sp:
-            result = main.run("bad cmd")
+            main.run("bad cmd")
         _, kwargs = mock_sp.call_args
         assert kwargs.get("check") is False
 
@@ -611,8 +609,6 @@ class TestCleanupTemp:
 
     def test_skips_locked_files(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Заблокированные файлы не должны прерывать выполнение."""
-        import shutil as _shutil
-
         fake_temp = tmp_path / "temp"
         fake_temp.mkdir()
         good_file = fake_temp / "good.tmp"
