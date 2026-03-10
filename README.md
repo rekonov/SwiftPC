@@ -88,12 +88,6 @@ python main.py --dry-run
 
 ---
 
-## Screenshots
-
-<!-- TODO: Add screenshots -->
-
----
-
 ## Native C++ helper
 
 SwiftPC bundles `swiftpc_native.exe`, a small C++ helper for operations that require direct Win32 APIs:
