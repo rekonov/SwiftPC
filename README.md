@@ -6,7 +6,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?style=flat-square&logo=windows)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)
 ![C++](https://img.shields.io/badge/C%2B%2B-native%20helper-00599C?style=flat-square&logo=cplusplus)
-![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
+![License](https://img.shields.io/badge/license-All%20rights%20reserved-red?style=flat-square)
 
 **Windows PC optimizer for gaming.** Kills background bloat, stops unnecessary services, and tweaks system settings — then restores everything when you're done.
 
